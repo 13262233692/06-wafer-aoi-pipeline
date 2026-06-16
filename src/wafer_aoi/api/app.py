@@ -177,4 +177,37 @@ def create_app(config: AppConfig, orchestrator: "PipelineOrchestrator") -> FastA
         orch = app.state.orchestrator
         return orch.gpu_diagnostic()
 
+    @app.get("/api/ohem/stats")
+    async def ohem_stats() -> Dict:
+        """Return OHEM filter and hard-example archiver statistics."""
+        orch = app.state.orchestrator
+        return {
+            "ohem": orch.ohem_stats(),
+            "hard_example_archiver": orch.hard_example_stats(),
+        }
+
+    @app.post("/api/ohem/add_false_positive")
+    async def add_false_positive(features: List[List[float]]) -> Dict:
+        """Add false-positive feature vectors to the FAISS index.
+
+        Accepts a list of L2-normalized feature vectors (each of length
+        feature_dim) and inserts them into the false-positive index for
+        future OHEM similarity lookups.
+        """
+        orch = app.state.orchestrator
+        arr = np.array(features, dtype=np.float32)
+        if arr.ndim != 2:
+            raise HTTPException(status_code=400, detail="Features must be a 2D array")
+        count = orch.add_false_positive_features(arr)
+        return {"added": count, "total_in_index": orch.ohem_stats().get("fp_index_stats", {}).get("total_vectors", 0)}
+
+    @app.post("/api/ohem/save_index")
+    async def save_ohem_index() -> Dict:
+        """Persist the current FAISS false-positive index to disk."""
+        orch = app.state.orchestrator
+        if orch._fp_index is not None:
+            orch._fp_index.save()
+            return {"saved": True}
+        return {"saved": False, "reason": "FAISS index not initialized"}
+
     return app

@@ -74,6 +74,23 @@ class LoggingConfig(BaseSettings):
     level: str = "INFO"
 
 
+class OhemConfig(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="OHEM_")
+
+    enabled: bool = True
+    feature_dim: int = 256
+    patch_size: int = 64
+    context_padding_ratio: float = 0.15
+    ohem_conf_low: float = 0.4
+    ohem_conf_high: float = 0.7
+    similarity_threshold: float = 0.85
+    faiss_top_k: int = 3
+    faiss_index_path: str = "data/fp_index.faiss"
+    hard_example_dir: str = "data/hard_examples"
+    hard_example_queue_size: int = 512
+    archive_context_padding_ratio: float = 0.25
+
+
 class AppConfig:
     def __init__(self, config_path: Optional[str] = None):
         if config_path and Path(config_path).exists():
@@ -87,6 +104,7 @@ class AppConfig:
         self.scheduler = SchedulerConfig(**raw.get("scheduler", {}))
         self.api = APIConfig(**raw.get("api", {}))
         self.logging = LoggingConfig(**raw.get("logging", {}))
+        self.ohem = OhemConfig(**raw.get("ohem", {}))
 
     @classmethod
     def load(cls, config_path: Optional[str] = None) -> "AppConfig":

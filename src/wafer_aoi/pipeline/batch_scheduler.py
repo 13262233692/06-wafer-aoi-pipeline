@@ -9,9 +9,11 @@ from typing import Deque, Dict, List, Optional
 
 import numpy as np
 
-from wafer_aoi.config import InferenceConfig, SchedulerConfig
+from wafer_aoi.config import InferenceConfig, OhemConfig, SchedulerConfig
 from wafer_aoi.inference.cuda_pipeline import CudaAsyncPipeline
 from wafer_aoi.inference.yolo_postprocess import preprocess_batch, yolo_decode
+from wafer_aoi.ohem.ohem_filter import OhemFilter
+from wafer_aoi.ohem.hard_example_archiver import HardExampleArchiver
 from wafer_aoi.utils import DetectedDefect, InferenceResult, ThroughputMeter, setup_logger
 
 logger = setup_logger(__name__)
@@ -48,10 +50,14 @@ class BatchScheduler:
         pipeline: CudaAsyncPipeline,
         inf_config: InferenceConfig,
         sched_config: SchedulerConfig,
+        ohem_filter: Optional[OhemFilter] = None,
+        hard_example_archiver: Optional[HardExampleArchiver] = None,
     ):
         self.pipeline = pipeline
         self.inf_config = inf_config
         self.sched_config = sched_config
+        self.ohem_filter = ohem_filter
+        self.hard_example_archiver = hard_example_archiver
 
         self._input_queues: Dict[int, Deque[PendingFrame]] = {}
         self._result_queues: Dict[int, queue.Queue] = {}
@@ -126,7 +132,7 @@ class BatchScheduler:
         with self._lock:
             pending = sum(len(q) for q in self._input_queues.values())
             results = sum(q.qsize() for q in self._result_queues.values())
-        return {
+        s = {
             "pending_frames": pending,
             "result_queue_depth": results,
             "throughput_fps": self._meter.fps,
@@ -134,6 +140,11 @@ class BatchScheduler:
             "frames_processed_total": self._frames_processed,
             **self.pipeline.stats(),
         }
+        if self.ohem_filter is not None:
+            s["ohem"] = self.ohem_filter.stats()
+        if self.hard_example_archiver is not None:
+            s["hard_example_archiver"] = self.hard_example_archiver.stats()
+        return s
 
     def _collect_batch(self) -> Optional[List[PendingFrame]]:
         batch: List[PendingFrame] = []
@@ -221,7 +232,9 @@ class BatchScheduler:
             )
             infer_ms = meta.get("infer_time_ms", 0.0)
 
-            all_defects = []
+            all_defects: List[List[DetectedDefect]] = []
+            all_hard_examples = []
+
             for i, pf in enumerate(job.frames):
                 single_out = output[i : i + 1]
                 decoded = yolo_decode(
@@ -230,7 +243,30 @@ class BatchScheduler:
                     scale=job.scales[i],
                     pad=job.pads[i],
                 )
-                all_defects.append(decoded[0] if decoded else [])
+                defects = decoded[0] if decoded else []
+
+                if self.ohem_filter is not None and self.ohem_filter.is_available:
+                    kept, hard_examples = self.ohem_filter.filter_defects(
+                        pf.frame, defects
+                    )
+                    all_hard_examples.append((pf, hard_examples))
+                    defects = kept
+                else:
+                    all_hard_examples.append((pf, []))
+
+                all_defects.append(defects)
+
+            if self.hard_example_archiver is not None:
+                for pf, hard_examples in all_hard_examples:
+                    if not hard_examples:
+                        continue
+                    self.hard_example_archiver.submit_batch(
+                        camera_id=pf.camera_id,
+                        frame_id=pf.frame_id,
+                        timestamp=pf.timestamp,
+                        verdicts=hard_examples,
+                        frame=pf.frame,
+                    )
 
             now = time.perf_counter()
             for i, pf in enumerate(job.frames):

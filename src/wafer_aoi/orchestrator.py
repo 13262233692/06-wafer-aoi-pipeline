@@ -14,21 +14,27 @@ from wafer_aoi.inference.cuda_context import get_cuda_context
 from wafer_aoi.inference.cuda_pipeline import CudaAsyncPipeline
 from wafer_aoi.inference.trt_engine import TensorRTEngine
 from wafer_aoi.inference.yolo_postprocess import preprocess_batch, yolo_decode
+from wafer_aoi.ohem.feature_extractor import FeatureExtractor
+from wafer_aoi.ohem.faiss_index import FaissFalsePositiveIndex
+from wafer_aoi.ohem.ohem_filter import OhemFilter
+from wafer_aoi.ohem.hard_example_archiver import HardExampleArchiver
 from wafer_aoi.pipeline.batch_scheduler import BatchScheduler
-from wafer_aoi.utils import DetectedDefect, InferenceResult, setup_logger
+from wafer_aoi.utils import InferenceResult, setup_logger
 
 logger = setup_logger(__name__)
 
 
 class PipelineOrchestrator:
-    """Top-level orchestrator that wires together cameras, buffers, scheduler, and API.
+    """Top-level orchestrator that wires together cameras, buffers, scheduler,
+    OHEM filter, hard-example archiver, and API.
 
     Process / Thread layout:
     - 4x camera subprocess (GigECameraProcess) writing to shared memory
     - Main process:
         - Frame fetcher thread (1) reading shared memory -> scheduler input
         - Batch scheduler thread (1) batching + dispatching to CUDA streams
-        - Result collector thread (1 optional)
+          + OHEM filtering + hard example archival
+        - Hard example archiver thread (1) async disk writes
         - FastAPI server thread (1) for control panel
     """
 
@@ -42,6 +48,11 @@ class PipelineOrchestrator:
         self._trt_engine: Optional[TensorRTEngine] = None
         self._cuda_pipeline: Optional[CudaAsyncPipeline] = None
         self._scheduler: Optional[BatchScheduler] = None
+
+        self._ohem_filter: Optional[OhemFilter] = None
+        self._fp_index: Optional[FaissFalsePositiveIndex] = None
+        self._feature_extractor: Optional[FeatureExtractor] = None
+        self._hard_example_archiver: Optional[HardExampleArchiver] = None
 
         self._fetcher_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -62,13 +73,59 @@ class PipelineOrchestrator:
         self._cuda_pipeline = CudaAsyncPipeline(self._trt_engine, self.config.inference)
         self._cuda_pipeline.initialize()
 
+        self._init_ohem()
+
         self._scheduler = BatchScheduler(
-            self._cuda_pipeline, self.config.inference, self.config.scheduler
+            self._cuda_pipeline,
+            self.config.inference,
+            self.config.scheduler,
+            ohem_filter=self._ohem_filter,
+            hard_example_archiver=self._hard_example_archiver,
         )
         for cid in range(self.config.camera.num_cameras):
             self._scheduler.register_camera(cid)
 
         logger.info("Orchestrator initialization complete")
+
+    def _init_ohem(self):
+        ohem_cfg = self.config.ohem
+
+        self._feature_extractor = FeatureExtractor(
+            patch_size=(ohem_cfg.patch_size, ohem_cfg.patch_size),
+            feature_dim=ohem_cfg.feature_dim,
+            context_padding_ratio=ohem_cfg.context_padding_ratio,
+        )
+
+        self._fp_index = FaissFalsePositiveIndex(
+            feature_dim=ohem_cfg.feature_dim,
+            index_path=ohem_cfg.faiss_index_path,
+        )
+        self._fp_index.initialize()
+
+        if ohem_cfg.enabled and self._fp_index.is_available:
+            self._ohem_filter = OhemFilter(
+                feature_extractor=self._feature_extractor,
+                fp_index=self._fp_index,
+                ohem_low=ohem_cfg.ohem_conf_low,
+                ohem_high=ohem_cfg.ohem_conf_high,
+                similarity_threshold=ohem_cfg.similarity_threshold,
+                top_k=ohem_cfg.faiss_top_k,
+            )
+            logger.info(
+                "OHEM filter enabled: conf=[%.2f, %.2f], sim_threshold=%.2f",
+                ohem_cfg.ohem_conf_low,
+                ohem_cfg.ohem_conf_high,
+                ohem_cfg.similarity_threshold,
+            )
+        else:
+            self._ohem_filter = None
+            logger.info("OHEM filter disabled (enabled=%s, faiss=%s)", ohem_cfg.enabled, self._fp_index.is_available)
+
+        self._hard_example_archiver = HardExampleArchiver(
+            output_dir=ohem_cfg.hard_example_dir,
+            queue_size=ohem_cfg.hard_example_queue_size,
+            context_padding_ratio=ohem_cfg.archive_context_padding_ratio,
+        )
 
     def _start_camera_process(self, cam_id: int):
         if cam_id in self._camera_processes and self._camera_processes[cam_id].is_alive():
@@ -113,7 +170,6 @@ class PipelineOrchestrator:
             self._stop_camera_process(cid)
 
     def _frame_fetcher_loop(self):
-        """Continuously read frames from shared memory and feed into scheduler."""
         logger.info("Frame fetcher thread started")
         assert self._buffer_manager is not None
         assert self._scheduler is not None
@@ -165,6 +221,10 @@ class PipelineOrchestrator:
             self.initialize()
 
         self._stop_event.clear()
+
+        if self._hard_example_archiver is not None:
+            self._hard_example_archiver.start()
+
         assert self._scheduler is not None
         self._scheduler.start()
 
@@ -187,6 +247,9 @@ class PipelineOrchestrator:
         if self._scheduler is not None:
             self._scheduler.stop()
 
+        if self._hard_example_archiver is not None:
+            self._hard_example_archiver.stop()
+
         if self._fetcher_thread is not None:
             self._fetcher_thread.join(timeout=3.0)
             self._fetcher_thread = None
@@ -196,6 +259,8 @@ class PipelineOrchestrator:
 
     def shutdown(self):
         self.stop_all()
+        if self._fp_index is not None:
+            self._fp_index.shutdown()
         if self._cuda_pipeline is not None:
             self._cuda_pipeline.shutdown()
         if self._trt_engine is not None:
@@ -227,6 +292,16 @@ class PipelineOrchestrator:
             return {}
         return self._cuda_pipeline.stats()
 
+    def ohem_stats(self) -> Dict:
+        if self._ohem_filter is not None:
+            return self._ohem_filter.stats()
+        return {"enabled": False}
+
+    def hard_example_stats(self) -> Dict:
+        if self._hard_example_archiver is not None:
+            return self._hard_example_archiver.stats()
+        return {}
+
     def get_latest_result(self, cam_id: int) -> Optional[InferenceResult]:
         if self._scheduler is None:
             return None
@@ -256,17 +331,8 @@ class PipelineOrchestrator:
             return result
 
     def rerun_inference(self, cam_id: int, frame: Optional[np.ndarray] = None) -> Optional[InferenceResult]:
-        """Force a re-inspection on a specific frame.
-
-        This method runs synchronously from the calling thread (e.g. a FastAPI
-        request handler).  It explicitly acquires the CUDA context to avoid
-        leaking implicit per-thread contexts—the core fix for the ~64MB/call
-        memory leak that crashed the line after ~500 wafers.
-        """
         if self._cuda_pipeline is None or self._trt_engine is None:
             return None
-
-        import time
 
         if frame is None:
             frame = self.get_latest_frame(cam_id)
@@ -276,7 +342,6 @@ class PipelineOrchestrator:
         cuda_ctx = get_cuda_context()
         with cuda_ctx.context_scope():
             cfg = self.config.inference
-
             batch = preprocess_batch([frame], cfg.input_width, cfg.input_height)
 
             slot_idx = self._cuda_pipeline.acquire_slot(timeout=0.1)
@@ -296,6 +361,17 @@ class PipelineOrchestrator:
         decoded = yolo_decode(output, cfg, scale=scale, pad=(pad_x, pad_y))
         defects = decoded[0] if decoded else []
 
+        if self._ohem_filter is not None and self._ohem_filter.is_available:
+            defects, hard_examples = self._ohem_filter.filter_defects(frame, defects)
+            if hard_examples and self._hard_example_archiver is not None:
+                self._hard_example_archiver.submit_batch(
+                    camera_id=cam_id,
+                    frame_id=-1,
+                    timestamp=time.perf_counter(),
+                    verdicts=hard_examples,
+                    frame=frame,
+                )
+
         result = InferenceResult(
             camera_id=cam_id,
             frame_id=-1,
@@ -314,6 +390,15 @@ class PipelineOrchestrator:
             result.inference_time_ms,
         )
         return result
+
+    def add_false_positive_features(
+        self, features: np.ndarray, metadata: Optional[List[Dict]] = None
+    ) -> int:
+        """Add known false-positive feature vectors to the FAISS index."""
+        if self._fp_index is None:
+            return 0
+        self._fp_index.add_vectors(features, metadata)
+        return features.shape[0]
 
     def gpu_diagnostic(self) -> Dict:
         cuda_ctx = get_cuda_context()

@@ -28,3 +28,17 @@ api:
 
 logging:
   level: "INFO"
+
+ohem:
+  enabled: true
+  feature_dim: 256
+  patch_size: 64
+  context_padding_ratio: 0.15
+  ohem_conf_low: 0.4
+  ohem_conf_high: 0.7
+  similarity_threshold: 0.85
+  faiss_top_k: 3
+  faiss_index_path: "data/fp_index.faiss"
+  hard_example_dir: "data/hard_examples"
+  hard_example_queue_size: 512
+  archive_context_padding_ratio: 0.25
