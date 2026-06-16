@@ -1,0 +1,35 @@
+[project]
+name = "wafer-aoi-pipeline"
+version = "0.1.0"
+description = "High-performance wafer defect detection pipeline with TensorRT acceleration"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "numpy>=1.26.0",
+    "opencv-python>=4.8.0",
+    "pyyaml>=6.0.1",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+]
+
+[project.optional-dependencies]
+tensorrt = [
+    "tensorrt>=10.0.0",
+    "pycuda>=2024.1",
+]
+camera = [
+    "pypylon>=3.0.0",
+]
+dev = [
+    "pytest>=7.4.0",
+    "black>=23.0.0",
+    "mypy>=1.7.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

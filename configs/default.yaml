@@ -1,0 +1,30 @@
+camera:
+  num_cameras: 4
+  frame_width: 1920
+  frame_height: 1200
+  fps: 60
+  pixel_format: "BGR8"
+  shared_memory_name_prefix: "wafer_camera_"
+  buffer_size: 10
+
+inference:
+  engine_path: "models/yolov8n_defect.engine"
+  input_width: 640
+  input_height: 640
+  max_batch_size: 8
+  num_classes: 4
+  class_names: ["scratch", "particle", "stain", "crack"]
+  conf_threshold: 0.5
+  nms_threshold: 0.45
+  num_streams: 4
+
+scheduler:
+  batch_timeout_us: 2000
+  max_batch_size: 8
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+
+logging:
+  level: "INFO"
