@@ -7,19 +7,11 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from wafer_aoi.config import InferenceConfig
+from wafer_aoi.inference.cuda_context import CudaContextManager, get_cuda_context
 from wafer_aoi.inference.trt_engine import TensorRTEngine
-from wafer_aoi.utils import setup_logger, ThroughputMeter
+from wafer_aoi.utils import ThroughputMeter, setup_logger
 
 logger = setup_logger(__name__)
-
-
-def _try_import_pycuda():
-    try:
-        import pycuda.driver as cuda
-        import pycuda.autoinit
-        return cuda
-    except ImportError:
-        return None
 
 
 @dataclass
@@ -31,6 +23,8 @@ class StreamSlot:
     h_output: Optional[np.ndarray] = None
     d_input: int = 0
     d_output: int = 0
+    d_input_size: int = 0
+    d_output_size: int = 0
     busy: bool = False
     meta: dict = field(default_factory=dict)
 
@@ -38,14 +32,17 @@ class StreamSlot:
 class CudaAsyncPipeline:
     """Multi-stream asynchronous CUDA pipeline: H2D copy -> inference -> D2H copy.
 
-    Uses N independent CUDA streams to overlap data transfer with compute,
-    achieving near-full GPU utilization under sustained load.
+    Every CUDA operation (stream creation, host/device memory allocation,
+    memcpy, inference submission) is explicitly wrapped in the singleton
+    CudaContextManager's context_scope() so the correct CUcontext is always
+    current on the calling thread. This eliminates the multi-threaded implicit
+    context creation that caused the gradual ~64MB/context memory leak.
     """
 
     def __init__(self, engine: TensorRTEngine, config: InferenceConfig):
         self.engine = engine
         self.config = config
-        self._cuda = _try_import_pycuda()
+        self._cuda_ctx: CudaContextManager = get_cuda_context()
         self._slots: List[StreamSlot] = []
         self._initialized = False
         self._meter = ThroughputMeter(window_size=200)
@@ -70,46 +67,66 @@ class CudaAsyncPipeline:
             output_size * 4,
         )
 
-        if self._cuda is None:
+        if not self._cuda_ctx.is_available:
             logger.warning("PyCUDA not available, creating simulated slots")
             for i in range(num_streams):
                 slot = StreamSlot(
-                    h_input=np.zeros((batch_size, 3, self.config.input_height, self.config.input_width), dtype=np.float32),
+                    h_input=np.zeros(
+                        (batch_size, 3, self.config.input_height, self.config.input_width),
+                        dtype=np.float32,
+                    ),
                     h_output=np.zeros(output_size, dtype=np.float32),
                 )
                 self._slots.append(slot)
             self._initialized = True
             return
 
-        self._cuda.init_device(0)
+        self._cuda_ctx.initialize()
 
-        for i in range(num_streams):
-            stream = self._cuda.Stream()
+        with self._cuda_ctx.context_scope():
+            cuda = self._cuda_ctx._cuda
 
-            h_input = self._cuda.pagelocked_empty(
-                (batch_size, 3, self.config.input_height, self.config.input_width),
-                dtype=np.float32,
-            )
-            h_output = self._cuda.pagelocked_empty(output_size, dtype=np.float32)
+            for i in range(num_streams):
+                stream = cuda.Stream()
 
-            d_input = self._cuda.mem_alloc(input_size * 4)
-            d_output = self._cuda.mem_alloc(output_size * 4)
+                h_input = cuda.pagelocked_empty(
+                    (batch_size, 3, self.config.input_height, self.config.input_width),
+                    dtype=np.float32,
+                )
+                h_output = cuda.pagelocked_empty(output_size, dtype=np.float32)
 
-            slot = StreamSlot(
-                stream=stream,
-                h_input=h_input,
-                h_output=h_output,
-                d_input=int(d_input),
-                d_output=int(d_output),
-            )
-            self._slots.append(slot)
-            logger.debug("Stream slot %d created", i)
+                d_input_alloc = cuda.mem_alloc(input_size * 4)
+                d_output_alloc = cuda.mem_alloc(output_size * 4)
+                d_input_ptr = int(d_input_alloc)
+                d_output_ptr = int(d_output_alloc)
 
+                self._cuda_ctx.register_allocation(d_input_ptr, input_size * 4)
+                self._cuda_ctx.register_allocation(d_output_ptr, output_size * 4)
+
+                slot = StreamSlot(
+                    stream=stream,
+                    h_input=h_input,
+                    h_output=h_output,
+                    d_input=d_input_ptr,
+                    d_output=d_output_ptr,
+                    d_input_size=input_size * 4,
+                    d_output_size=output_size * 4,
+                )
+                slot._d_input_alloc = d_input_alloc
+                slot._d_output_alloc = d_output_alloc
+                self._slots.append(slot)
+                logger.debug("Stream slot %d created", i)
+
+        info = self._cuda_ctx.get_memory_info()
+        logger.info(
+            "CUDA async pipeline initialized: %d streams, GPU used=%.1f/%.1f MB",
+            num_streams,
+            info.used_mb,
+            info.total_mb,
+        )
         self._initialized = True
-        logger.info("CUDA async pipeline initialized with %d streams", num_streams)
 
     def acquire_slot(self, timeout: float = 0.001) -> Optional[int]:
-        """Try to acquire a free stream slot. Returns slot index or None."""
         deadline = time.perf_counter() + timeout
         while time.perf_counter() < deadline:
             for idx, slot in enumerate(self._slots):
@@ -125,14 +142,6 @@ class CudaAsyncPipeline:
         preprocessed_batch: np.ndarray,
         meta: Optional[dict] = None,
     ) -> Tuple[np.ndarray, dict]:
-        """Submit a batch to a stream slot and block until completion.
-
-        For simpler scheduling we run synchronously per slot; the multi-stream
-        design allows the scheduler to overlap work across slots by pipelining.
-
-        Returns:
-            (output_array, metadata_dict)
-        """
         slot = self._slots[slot_idx]
         batch_size = preprocessed_batch.shape[0]
 
@@ -174,28 +183,49 @@ class CudaAsyncPipeline:
         return self._meter.latency_ms
 
     def stats(self) -> dict:
-        return {
+        base = {
             "num_streams": self.num_streams,
             "throughput_fps": self._meter.fps,
             "per_batch_latency_ms": self._meter.latency_ms,
             "per_image_estimate_ms": self._meter.latency_ms / max(1, self.config.max_batch_size),
             "busy_slots": sum(1 for s in self._slots if s.busy),
         }
+        if self._cuda_ctx.is_available:
+            info = self._cuda_ctx.get_memory_info()
+            base.update({
+                "gpu_used_mb": info.used_mb,
+                "gpu_free_mb": info.free_mb,
+                "gpu_total_mb": info.total_mb,
+            })
+        return base
 
     def shutdown(self):
-        if self._cuda is None:
+        if not self._cuda_ctx.is_available:
             self._slots.clear()
             self._initialized = False
             return
 
-        for slot in self._slots:
-            try:
-                if slot.d_input:
-                    self._cuda.DeviceAllocation(slot.d_input).free()
-                if slot.d_output:
-                    self._cuda.DeviceAllocation(slot.d_output).free()
-            except Exception:
-                pass
+        if not self._initialized:
+            return
+
+        with self._cuda_ctx.context_scope():
+            for slot in self._slots:
+                try:
+                    alloc_in = getattr(slot, "_d_input_alloc", None)
+                    alloc_out = getattr(slot, "_d_output_alloc", None)
+                    if alloc_in is not None:
+                        self._cuda_ctx.unregister_allocation(slot.d_input)
+                        alloc_in.free()
+                    if alloc_out is not None:
+                        self._cuda_ctx.unregister_allocation(slot.d_output)
+                        alloc_out.free()
+                except Exception as e:
+                    logger.debug("Error freeing slot memory: %s", e)
+
         self._slots.clear()
         self._initialized = False
-        logger.info("CUDA async pipeline shut down")
+        info = self._cuda_ctx.get_memory_info()
+        logger.info(
+            "CUDA async pipeline shut down, GPU free=%.1f MB",
+            info.free_mb,
+        )

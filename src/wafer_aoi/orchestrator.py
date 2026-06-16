@@ -10,10 +10,12 @@ import numpy as np
 from wafer_aoi.config import AppConfig
 from wafer_aoi.camera.gige_capture import GigECameraProcess
 from wafer_aoi.camera.shared_buffer import SharedBufferManager
+from wafer_aoi.inference.cuda_context import get_cuda_context
 from wafer_aoi.inference.cuda_pipeline import CudaAsyncPipeline
 from wafer_aoi.inference.trt_engine import TensorRTEngine
+from wafer_aoi.inference.yolo_postprocess import preprocess_batch, yolo_decode
 from wafer_aoi.pipeline.batch_scheduler import BatchScheduler
-from wafer_aoi.utils import InferenceResult, setup_logger
+from wafer_aoi.utils import DetectedDefect, InferenceResult, setup_logger
 
 logger = setup_logger(__name__)
 
@@ -252,3 +254,67 @@ class PipelineOrchestrator:
                     "inference_time_ms": r.inference_time_ms,
                 }
             return result
+
+    def rerun_inference(self, cam_id: int, frame: Optional[np.ndarray] = None) -> Optional[InferenceResult]:
+        """Force a re-inspection on a specific frame.
+
+        This method runs synchronously from the calling thread (e.g. a FastAPI
+        request handler).  It explicitly acquires the CUDA context to avoid
+        leaking implicit per-thread contexts—the core fix for the ~64MB/call
+        memory leak that crashed the line after ~500 wafers.
+        """
+        if self._cuda_pipeline is None or self._trt_engine is None:
+            return None
+
+        import time
+
+        if frame is None:
+            frame = self.get_latest_frame(cam_id)
+        if frame is None:
+            return None
+
+        cuda_ctx = get_cuda_context()
+        with cuda_ctx.context_scope():
+            cfg = self.config.inference
+
+            batch = preprocess_batch([frame], cfg.input_width, cfg.input_height)
+
+            slot_idx = self._cuda_pipeline.acquire_slot(timeout=0.1)
+            if slot_idx is None:
+                return None
+
+            try:
+                output, meta = self._cuda_pipeline.submit(slot_idx, batch)
+            finally:
+                pass
+
+        h, w = frame.shape[:2]
+        scale = min(cfg.input_width / w, cfg.input_height / h)
+        pad_x = (cfg.input_width - int(w * scale)) // 2
+        pad_y = (cfg.input_height - int(h * scale)) // 2
+
+        decoded = yolo_decode(output, cfg, scale=scale, pad=(pad_x, pad_y))
+        defects = decoded[0] if decoded else []
+
+        result = InferenceResult(
+            camera_id=cam_id,
+            frame_id=-1,
+            timestamp=time.perf_counter(),
+            defects=defects,
+            inference_time_ms=meta.get("infer_time_ms", 0.0),
+        )
+
+        with self._result_lock:
+            self._recent_results[cam_id] = result
+
+        logger.info(
+            "Manual re-inspection camera %d: %d defects, %.2f ms",
+            cam_id,
+            len(defects),
+            result.inference_time_ms,
+        )
+        return result
+
+    def gpu_diagnostic(self) -> Dict:
+        cuda_ctx = get_cuda_context()
+        return cuda_ctx.diagnostic_dump()

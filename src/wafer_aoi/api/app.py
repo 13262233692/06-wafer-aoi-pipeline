@@ -149,4 +149,32 @@ def create_app(config: AppConfig, orchestrator: "PipelineOrchestrator") -> FastA
             },
         }
 
+    @app.post("/api/cameras/{cam_id}/reinspect")
+    async def reinspect_camera(cam_id: int) -> Dict:
+        """Force synchronous re-inspection of the latest frame from a camera.
+
+        This endpoint safely invokes inference from the FastAPI request thread
+        by using the process-wide CudaContextManager.  Without the explicit
+        context push/pop inside orchestrator.rerun_inference, each request
+        would implicitly create a new CUDA primary context on the request
+        thread, leaking ~64 MB until the driver runs out of memory.
+        """
+        orch = app.state.orchestrator
+        if cam_id >= config.camera.num_cameras:
+            raise HTTPException(status_code=404, detail=f"Camera {cam_id} not found")
+
+        import asyncio
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, orch.rerun_inference, cam_id, None)
+
+        if result is None:
+            raise HTTPException(status_code=503, detail="Inference pipeline not ready")
+        return {"camera_id": cam_id, "result": result.to_dict()}
+
+    @app.get("/api/gpu/diagnostic")
+    async def gpu_diagnostic() -> Dict:
+        """Return GPU memory and CUDA context diagnostics."""
+        orch = app.state.orchestrator
+        return orch.gpu_diagnostic()
+
     return app
